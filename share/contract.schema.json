@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "goal": { "type": "string" },
+    "done_when": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 5 },
+    "out_of_scope": { "type": "array", "items": { "type": "string" } },
+    "assumptions": { "type": "array", "items": { "type": "string" } },
+    "questions": { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
+    "risk": { "type": "string", "enum": ["low", "medium", "high"] }
+  },
+  "required": ["goal", "done_when", "out_of_scope", "assumptions", "questions", "risk"]
+}

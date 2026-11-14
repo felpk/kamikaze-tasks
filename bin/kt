@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# kamikaze-tasks: one task, one contract, one run, then the pane dies.
+set -euo pipefail
+
+KT_VERSION=0.1.0
+KT_HOME="${KT_HOME:-$HOME/.kamikaze}"
+KT_CLAUDE="${KT_CLAUDE:-claude}"
+KT_COUNTDOWN="${KT_COUNTDOWN:-5}"
+KT_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+SHARE="$KT_ROOT/share"
+INBOX="$KT_HOME/inbox.md"
+
+if [ -t 1 ]; then
+  B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' O=$'\e[0m'
+else
+  B= D= R= G= Y= O=
+fi
+
+die() { echo "kt: $*" >&2; exit 1; }
+for dep in jq "$KT_CLAUDE"; do command -v "$dep" >/dev/null || die "missing dependency: $dep"; done
+mkdir -p "$KT_HOME/runs"
+
+# Hard stop for destructive commands during the run, whatever the permission
+# mode (deny rules win even over bypassPermissions). The agent must report
+# BLOCKED and let a human do these.
+KT_DENY_DEFAULT=(
+  "Bash(rm -rf:*)" "Bash(rm -fr:*)" "Bash(rm -r:*)" "Bash(sudo:*)"
+  "Bash(git push --force:*)" "Bash(git push -f:*)" "Bash(git reset --hard:*)"
+  "Bash(git clean:*)" "Bash(git branch -D:*)" "Bash(git filter-branch:*)"
+  "Bash(dd:*)" "Bash(mkfs:*)" "Bash(shred:*)" "Bash(truncate:*)"
+  "Bash(docker system prune:*)" "Bash(docker volume rm:*)" "Bash(docker rm:*)"
+  "Bash(docker stack rm:*)" "Bash(kubectl delete:*)" "Bash(terraform destroy:*)"
+  "Bash(gh repo delete:*)" "Bash(gh repo edit:*)" "Bash(dropdb:*)"
+)
+if [ -n "${KT_DENY:-}" ]; then IFS=',' read -r -a KT_DENY_LIST <<<"$KT_DENY"; else KT_DENY_LIST=("${KT_DENY_DEFAULT[@]}"); fi
+
+usage() {
+  cat <<EOF
+kt $KT_VERSION · one task, one contract, one run, then the pane dies.
+
+  kt "task"              contract -> confirm -> run -> verify -> pane closes
+  kt                     ask for the task first (for a tmux key binding)
+  kt new "task"          same, in a new tmux pane
+  kt resume <id> [answer]  continue a BLOCKED run
+  kt inbox [take N|clear]  side findings parked by runs
+  kt log [id]            past runs
+  kt park "text"         add a line to the inbox
+  kt die                 close this tmux pane in 2s (used by the skill)
+
+flags: -y/--yes skip confirmation when risk is low and nothing is unclear
+       -k/--keep keep the pane open at the end
+guard: destructive commands (rm -rf, push --force, reset --hard, prune…) are
+       denied during the run; the agent stops BLOCKED and you do them by hand.
+env:   KT_DENY (comma list, replaces the default deny list)
+       KT_PERMISSION_MODE (run mode, default: your settings, else acceptEdits)
+       KT_MODEL  KT_HOME  KT_COUNTDOWN
+EOF
+}
+
+# ask <schema> <system-prompt-file> [claude args...] < prompt  -> claude json
+ask() {
+  local schema=$1 sys=$2; shift 2
+  local args=(-p --output-format json --json-schema "$(cat "$schema")" --append-system-prompt "$(cat "$sys")")
+  [ -n "${KT_MODEL:-}" ] && args+=(--model "$KT_MODEL")
+  "$KT_CLAUDE" "${args[@]}" "$@"
+}
+
+run_mode() {
+  if [ -n "${KT_PERMISSION_MODE:-}" ]; then echo "$KT_PERMISSION_MODE"; return; fi
+  local m
+  m=$(jq -r '.permissions.defaultMode // empty' "$HOME/.claude/settings.json" 2>/dev/null || true)
+  echo "${m:-acceptEdits}"
+}
+
+bullets() { jq -r --arg p "$2" ".$1[]? | \"  \(\$p) \(.)\"" "$3"; }
+
+show_contract() {
+  local f=$1 risk
+  risk=$(jq -r .risk "$f")
+  case $risk in high) risk="$R$risk$O";; medium) risk="$Y$risk$O";; *) risk="$G$risk$O";; esac
+  echo
+  echo "${B}GOAL${O}       $(jq -r .goal "$f")"
+  echo "${B}DONE WHEN${O}"; bullets done_when "✓" "$f"
+  [ "$(jq '.out_of_scope|length' "$f")" -gt 0 ] && { echo "${B}NOT DOING${O}"; bullets out_of_scope "✗" "$f"; }
+  [ "$(jq '.assumptions|length' "$f")" -gt 0 ] && { echo "${B}ASSUMING${O}"; bullets assumptions "·" "$f"; }
+  echo "${B}RISK${O}       $risk"
+  echo
+}
+
+show_report() {
+  local f=$1 st
+  st=$(jq -r .status "$f")
+  case $st in DONE) st="$G$st$O";; BLOCKED) st="$Y$st$O";; *) st="$R$st$O";; esac
+  echo
+  echo "${B}$st${O}  $(jq -r .summary "$f")"
+  jq -r '.checks[]? | "  \(if .passed then "✓" else "✗" end) \(.criterion)\n      '"$D"'\(.evidence)'"$O"'"' "$f"
+  [ "$(jq '.parked|length' "$f")" -gt 0 ] && { echo "${B}PARKED${O} (kt inbox)"; bullets parked "→" "$f"; }
+  [ "$(jq -r '.question // ""' "$f")" != "" ] && echo "${Y}?${O} $(jq -r .question "$f")"
+  echo
+}
+
+park() { # text [run-id]
+  local where; where=$(pwd)
+  printf -- '- [ ] %s  _(%s%s, %s)_\n' "$1" "${2:+run }" "${2:-manual}" "$where" >> "$INBOX"
+}
+
+die_pane() { # keep
+  [ "$1" = 1 ] && return 0
+  [ -n "${TMUX_PANE:-}" ] || return 0
+  if [ -t 0 ] && [ "$KT_COUNTDOWN" -gt 0 ]; then
+    local i
+    for ((i = KT_COUNTDOWN; i > 0; i--)); do
+      printf '\r%spane closes in %ss · any key keeps it%s ' "$D" "$i" "$O"
+      if read -rsn1 -t1; then echo; return 0; fi
+    done
+    echo
+  fi
+  tmux kill-pane -t "$TMUX_PANE"
+}
+
+write_contract() { # dir
+  local dir=$1 out
+  out=$(ask "$SHARE/contract.schema.json" "$SHARE/contract.md" --permission-mode plan < "$dir/brief.txt") \
+    || die "claude failed while writing the contract"
+  jq -e '.structured_output | objects' <<<"$out" > "$dir/contract.json" \
+    || die "no contract came back: $(jq -r '.result // .' <<<"$out" | head -c 300)"
+  jq -r .session_id <<<"$out" > "$dir/session"
+}
+
+execute() { # dir prompt
+  local dir=$1 prompt=$2 out
+  echo "${D}running in $(cat "$dir/cwd") · mode $(run_mode) · run $(basename "$dir")${O}"
+  out=$(printf '%s' "$prompt" | ask "$SHARE/report.schema.json" "$SHARE/execute.md" \
+          --resume "$(cat "$dir/session")" --permission-mode "$(run_mode)" \
+          --disallowedTools "${KT_DENY_LIST[@]}") \
+    || die "claude failed during the run (kt log $(basename "$dir"))"
+  jq -r '.session_id // empty' <<<"$out" > "$dir/session.new" && [ -s "$dir/session.new" ] && mv "$dir/session.new" "$dir/session"
+  rm -f "$dir/session.new"
+  jq -e '.structured_output | objects' <<<"$out" > "$dir/report.json" \
+    || die "no report came back: $(jq -r '.result // .' <<<"$out" | head -c 300)"
+  # DONE with a failed check is not DONE.
+  if jq -e '.status == "DONE" and any(.checks[]?; .passed | not)' "$dir/report.json" >/dev/null; then
+    jq '.status = "FAILED"' "$dir/report.json" > "$dir/r.tmp" && mv "$dir/r.tmp" "$dir/report.json"
+  fi
+  jq -r .status "$dir/report.json" > "$dir/status"
+  local id; id=$(basename "$dir")
+  while IFS= read -r item; do [ -n "$item" ] && park "$item" "$id"; done < <(jq -r '.parked[]?' "$dir/report.json")
+}
+
+finish() { # dir keep
+  local dir=$1 keep=$2 id st
+  id=$(basename "$dir"); st=$(cat "$dir/status")
+  show_report "$dir/report.json"
+  if [ "$st" = BLOCKED ] && [ -t 0 ]; then
+    local a
+    read -r -e -p "answer now, or Enter to park it and close › " a || a=
+    if [ -n "$a" ]; then resume "$id" "$a" "$keep"; return; fi
+  fi
+  if [ "$st" != DONE ]; then
+    park "$st: $(jq -r '.question // .summary' "$dir/report.json") → kt resume $id" "$id"
+    echo "${D}parked in inbox · kt log $id${O}"
+  fi
+  die_pane "$keep"
+}
+
+run_task() { # task yes keep
+  local task=$1 yes=$2 keep=$3 id dir
+  id=$(date +%Y%m%d-%H%M%S)-$RANDOM; dir="$KT_HOME/runs/$id"
+  mkdir -p "$dir"; pwd > "$dir/cwd"; printf '%s\n' "$task" > "$dir/task.txt"; printf 'Task: %s\n' "$task" > "$dir/brief.txt"
+
+  local round=0 k q a
+  while :; do
+    echo "${D}writing the contract…${O}"
+    write_contract "$dir"
+    show_contract "$dir/contract.json"
+    if [ "$(jq '.questions|length' "$dir/contract.json")" -gt 0 ] && [ $round -lt 3 ]; then
+      [ -t 0 ] || die "the task is unclear and there is no terminal to ask: $(jq -r '.questions|join(" | ")' "$dir/contract.json")"
+      while IFS= read -r q <&3; do
+        read -r -e -p "${Y}?${O} $q › " a
+        printf 'Q: %s\nA: %s\n' "$q" "$a" >> "$dir/brief.txt"
+      done 3< <(jq -r '.questions[]' "$dir/contract.json")
+      round=$((round + 1)); continue
+    fi
+    if [ "$yes" = 1 ] && [ "$(jq -r .risk "$dir/contract.json")" != high ]; then break; fi
+    [ -t 0 ] || die "confirmation needed (risk $(jq -r .risk "$dir/contract.json")); run in a terminal or use --yes"
+    read -r -e -p "Enter = go · type a correction · q = quit › " k
+    case $k in
+      "") break ;;
+      q|Q) echo "dropped."; rm -rf "$dir"; die_pane "$keep"; return ;;
+      *) printf 'Correction from the user: %s\n' "$k" >> "$dir/brief.txt" ;;
+    esac
+  done
+
+  execute "$dir" "Execute this contract now. Contract:
+$(cat "$dir/contract.json")
+
+Task as the user wrote it, with clarifications:
+$(cat "$dir/brief.txt")"
+  finish "$dir" "$keep"
+}
+
+resume() { # id answer keep
+  local id=$1 a=${2:-} keep=${3:-0} dir="$KT_HOME/runs/$1"
+  [ -d "$dir" ] || die "no run $id (kt log)"
+  if [ -z "$a" ]; then
+    jq -r '.question // .summary' "$dir/report.json"
+    [ -t 0 ] || die "give the answer as an argument"
+    read -r -e -p "answer › " a
+  fi
+  printf 'Answer to your question: %s\n' "$a" >> "$dir/brief.txt"
+  cd "$(cat "$dir/cwd")"
+  execute "$dir" "The user answered: $a
+Continue the same contract from where you stopped. Same rules, same report format."
+  finish "$dir" "$keep"
+}
+
+cmd_log() {
+  if [ -n "${1:-}" ]; then
+    local dir="$KT_HOME/runs/$1"; [ -d "$dir" ] || die "no run $1"
+    echo "${D}$(cat "$dir/cwd")${O}  $(cat "$dir/task.txt")"
+    [ -f "$dir/contract.json" ] && show_contract "$dir/contract.json"
+    [ -f "$dir/report.json" ] && show_report "$dir/report.json"
+    return
+  fi
+  local d
+  for d in $(ls -1 "$KT_HOME/runs" 2>/dev/null | tail -20); do
+    printf '%s  %-8s %s\n' "$d" "$(cat "$KT_HOME/runs/$d/status" 2>/dev/null || echo '-')" "$(head -c 70 "$KT_HOME/runs/$d/task.txt")"
+  done
+}
+
+cmd_inbox() {
+  touch "$INBOX"
+  case ${1:-} in
+    clear) : > "$INBOX"; echo "inbox cleared." ;;
+    take)
+      local n=${2:-}; [[ $n =~ ^[0-9]+$ ]] || die "usage: kt inbox take N"
+      local line; line=$(sed -n "${n}p" "$INBOX"); [ -n "$line" ] || die "no item $n"
+      sed -i "${n}d" "$INBOX"
+      line=${line#- \[ \] }; line=${line%%  _(*}
+      run_task "$line" 0 0 ;;
+    *) [ -s "$INBOX" ] && nl -w2 -s'. ' "$INBOX" || echo "inbox empty." ;;
+  esac
+}
+
+yes=0 keep=0 args=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -y|--yes) yes=1 ;;
+    -k|--keep) keep=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -V|--version) echo "$KT_VERSION"; exit 0 ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+set -- "${args[@]+"${args[@]}"}"
+
+case ${1:-} in
+  "")
+    [ -t 0 ] || { usage; exit 1; }
+    read -r -e -p "kamikaze › " t; [ -n "$t" ] || exit 0
+    run_task "$t" "$yes" "$keep" ;;
+  new)
+    shift; [ -n "${TMUX:-}" ] || die "kt new needs tmux"
+    tmux split-window -c "$PWD" "$(printf '%q ' "$0" "$@")" ;;
+  resume) shift; resume "${1:-}" "${2:-}" "$keep" ;;
+  inbox) shift; cmd_inbox "$@" ;;
+  log) shift; cmd_log "${1:-}" ;;
+  park) shift; [ -n "${1:-}" ] || die "usage: kt park \"text\""; park "$*"; echo "parked." ;;
+  die)
+    [ -n "${TMUX_PANE:-}" ] || { echo "not in tmux; nothing to close."; exit 0; }
+    (sleep "${KT_DIE_DELAY:-2}"; tmux kill-pane -t "$TMUX_PANE") >/dev/null 2>&1 &
+    disown; echo "pane closes in ${KT_DIE_DELAY:-2}s." ;;
+  help) usage ;;
+  *) run_task "$*" "$yes" "$keep" ;;
+esac

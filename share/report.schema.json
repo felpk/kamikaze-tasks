@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "status": { "type": "string", "enum": ["DONE", "BLOCKED", "FAILED"] },
+    "summary": { "type": "string" },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "criterion": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "evidence": { "type": "string" }
+        },
+        "required": ["criterion", "passed", "evidence"]
+      }
+    },
+    "assumptions_made": { "type": "array", "items": { "type": "string" } },
+    "parked": { "type": "array", "items": { "type": "string" } },
+    "question": { "type": "string" }
+  },
+  "required": ["status", "summary", "checks", "assumptions_made", "parked"]
+}

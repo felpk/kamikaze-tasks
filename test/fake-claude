@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Stand-in for `claude -p`: answers from fixture files, logs what it got.
+mode=""; prev=""
+for a in "$@"; do [ "$prev" = --permission-mode ] && mode=$a; prev=$a; done
+cat >> "$FAKE_DIR/stdin.log"; echo "--- mode=$mode args=$(echo "$*" | tr "\n" " ")" >> "$FAKE_DIR/stdin.log"
+if [ "$mode" = plan ]; then
+  n=$(cat "$FAKE_DIR/contract.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_DIR/contract.n"
+  f="$FAKE_DIR/contract.$n.json"; [ -f "$f" ] || f="$FAKE_DIR/contract.json"
+else
+  n=$(cat "$FAKE_DIR/report.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_DIR/report.n"
+  f="$FAKE_DIR/report.$n.json"; [ -f "$f" ] || f="$FAKE_DIR/report.json"
+fi
+jq -n --slurpfile s "$f" '{type:"result",subtype:"success",is_error:false,session_id:"sess-1",structured_output:$s[0],result:""}'
