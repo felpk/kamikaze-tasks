@@ -1,0 +1,9 @@
+{
+  "$schema": "https://www.schemastore.org/claude-code-marketplace.json",
+  "name": "kamikaze-tasks",
+  "description": "One-shot Claude Code tasks with a contract and verified checks.",
+  "owner": { "name": "felpk" },
+  "plugins": [
+    { "name": "kamikaze-tasks", "description": "Contract, run, verify, report, close the pane.", "source": "./", "category": "productivity" }
+  ]
+}

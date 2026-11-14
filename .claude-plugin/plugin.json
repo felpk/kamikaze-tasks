@@ -1,0 +1,9 @@
+{
+  "name": "kamikaze-tasks",
+  "version": "0.1.0",
+  "description": "One task, one contract, one run, then the tmux pane dies.",
+  "author": { "name": "felpk", "url": "https://github.com/felpk" },
+  "repository": "https://github.com/felpk/kamikaze-tasks",
+  "license": "MIT",
+  "keywords": ["tmux", "contract", "one-shot", "verification", "agents"]
+}
