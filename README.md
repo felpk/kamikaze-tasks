@@ -78,6 +78,6 @@ test/run.sh   # flow tests with a fake claude: no network, no tokens
 ## See also
 
 - [beautify-tmux](https://github.com/felpk/beautify-tmux): colours each pane border by the agent's state.
-- [cheap-eyes](https://github.com/felpk/cheap-eyes): checks web pages as text instead of screenshots.
+- [claude-visual-check-no-images](https://github.com/felpk/claude-visual-check-no-images): checks web pages as text instead of screenshots.
 
 MIT
